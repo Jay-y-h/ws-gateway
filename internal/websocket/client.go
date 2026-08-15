@@ -3,7 +3,6 @@ package websocket
 import (
 	"encoding/json"
 	"log/slog"
-	"strings"
 	"ws-gateway/internal/protocol"
 
 	"github.com/gorilla/websocket"
@@ -12,91 +11,133 @@ import (
 type Client struct {
 	conn *websocket.Conn
 	server *Server
-	//device/browser
-	clientType string
-
+	ID string
+	Type string
+	// 写消息的 channel
+	send chan []byte
+	// closed 标记该 client 是否已经被关闭/注销，避免重复 close(send)
+	closed bool
 }
-
 func NewClient(
 	conn *websocket.Conn,
 	server *Server,
 )*Client{
-
 	return &Client{
-		conn:conn,
-		server:server,
+		conn:   conn,
+		server: server,
+		send:   make(chan []byte, 256),
 	}
 }
 
-func (c *Client) ReadLoop(){
-	defer func(){
-		c.server.unregister<-c
+func (c *Client) ReadLoop() {
+	defer func() {
+		c.server.unregister <- c
 	}()
-
 	for {
-		_,data,err:=c.conn.ReadMessage()
-		if err!=nil{
-			slog.Error(
-				"读取失败",
-				"error",
+		_, data, err := c.conn.ReadMessage()
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(
 				err,
-			)
-			break
+				websocket.CloseGoingAway,
+				websocket.CloseAbnormalClosure,
+			) {
+				slog.Warn(
+					"读取 websocket 失败",
+					"id", c.ID,
+					"error", err,
+				)
+			}
+			return
 		}
 		slog.Info("收到ws数据","ws数据",data)
-
-		var check struct{
-			CellSN string `json:"cellSN"`
-			TestTime string `json:"testTime"`
-		}
-		json.Unmarshal(data,&check)
-		if check.CellSN!="" && check.TestTime!=""{
-			
-			c.server.browserBroadcast<-data
-			continue
-		}
-
 		var msg protocol.Message
-
-		err = json.Unmarshal(data,&msg)
-		if err!=nil{
-			slog.Error(
-				"json解析失败",
-				"error",
-				err,
+		err = json.Unmarshal(
+			data,
+			&msg,
+		)
+		if err != nil {
+			slog.Warn(
+				"无效消息",
+				"id", c.ID,
+				"error", err,
 			)
 			continue
 		}
-		
 
-		if strings.Contains(msg.DevId,"dev"){
-			slog.Info("设备数据","dev_id",msg.DevId)
-			c.server.browserBroadcast<-data
-			continue
+		// 分选机发送的不是 Message，
+		// 而是直接发送检测结果 JSON
+		if msg.From == "" && msg.ID == "" {
+			var payload any
+
+			if err := json.Unmarshal(data, &payload); err != nil {
+				slog.Warn(
+					"分选机数据解析失败",
+					"id", c.ID,
+					"error", err,
+				)
+				continue
+			}
+
+			msg = protocol.Message{
+				Type:    "sort_result",
+				From:    c.ID,
+				Payload: payload,
+			}
+		} else {
+			// 不相信客户端自己传的 From
+			msg.From = c.ID
 		}
-		slog.Info("browser命令","browser",msg.DevId)
-		
-		c.server.deviceBroadcast<-data
-	}
 
+		
+		slog.Info("即将发送数据","数据",msg)
+		c.server.route <- &msg
+	}
 }
 
-func (c *Client) Send(
-	data []byte,
-){
 
-	err:=c.conn.WriteMessage(
-		websocket.TextMessage,
-		data,
-	)
-
-	if err!=nil{
-
-		slog.Error(
-			"发送失败",
-			"error",
-			err,
+func (c *Client) WriteLoop() {
+	defer c.conn.Close()
+	for data := range c.send {
+		err := c.conn.WriteMessage(
+			websocket.TextMessage,
+			data,
 		)
+		if err != nil {
+			slog.Warn(
+				"发送 websocket 失败",
+				"id", c.ID,
+				"error", err,
+			)
+			return
+		}
+	}
+}
+
+func (c *Client) Send(msg *protocol.Message) error {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return err
 	}
 
+	return c.enqueue(data)
+}
+
+
+func (c *Client) enqueue(data []byte) error {
+	select {
+	case c.send <- data:
+		return nil
+	default:
+		slog.Warn(
+			"客户端发送缓冲已满，判定为异常连接，触发断开",
+			"id", c.ID,
+		)
+		// 非阻塞地通知注销；如果 unregister 也满/慢，丢弃即可，
+		// 不能阻塞在这里。
+		select {
+		case c.server.unregister <- c:
+		default:
+		}
+		return websocket.ErrCloseSent
+	}
 }

@@ -1,8 +1,12 @@
 package protocol
 
 type Message struct {
-	DevId string `json:"dev_id"`
-	Msg   string `json:"msg"`
+	ID        string `json:"id"`
+	Type      string `json:"type"`
+	From      string `json:"from"`
+	To        string `json:"to,omitempty"`
+	Timestamp int64  `json:"timestamp"`
+	Payload   any    `json:"payload,omitempty"`
 }
 
 type DianxinTestData struct {
