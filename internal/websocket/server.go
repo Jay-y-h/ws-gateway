@@ -11,14 +11,18 @@ import (
 
 type Server struct {
 	upgrader websocket.Upgrader
-	// 所有 WS 客户端
-	clients map[*Client]bool
-	// 根据 clientID 查找客户端
+
+	clients    map[*Client]bool
 	clientByID map[string]*Client
+
 	register   chan *Client
 	unregister chan *Client
-	// 所有消息统一从这里进入
-	route chan *protocol.Message
+	route      chan routeMessage
+}
+
+type routeMessage struct {
+	client *Client
+	msg    *protocol.Message
 }
 
 func NewServer() *Server {
@@ -31,13 +35,15 @@ func NewServer() *Server {
 
 		clients:    make(map[*Client]bool),
 		clientByID: make(map[string]*Client),
-	
 
 		register:   make(chan *Client),
 		unregister: make(chan *Client),
-
-		route: make(chan *protocol.Message),
+		route:      make(chan routeMessage),
 	}
+}
+
+func clientKey(typ, id string) string {
+	return typ + ":" + id
 }
 
 func (s *Server) Run() {
@@ -45,62 +51,56 @@ func (s *Server) Run() {
 		select {
 		case client := <-s.register:
 			s.registerClient(client)
+
 		case client := <-s.unregister:
 			s.unregisterClient(client)
-		case msg := <-s.route:
-			s.routeMessage(msg)
+
+		case route := <-s.route:
+			s.routeMessage(route.client, route.msg)
 		}
 	}
 }
 
-func (s *Server) registerClient(
-	client *Client,
-) {
-	// 同一个 ID 已经有一个连接在线：先把旧连接关掉再让新连接顶替，
-	// 避免旧连接的 goroutine 泄漏，也避免旧连接后续断开时把新连接从
-	// clientByID 里错误地删掉。
-	if old, ok := s.clientByID[client.ID]; ok && old != client {
-		slog.Warn(
-			"同一 ID 重复连接，关闭旧连接",
+func (s *Server) registerClient(client *Client) {
+	key := clientKey(client.Type, client.ID)
+
+	if old, ok := s.clientByID[key]; ok && old != client {
+		slog.Warn("同一 ID 重复连接，关闭旧连接",
 			"id", client.ID,
+			"type", client.Type,
 		)
 		s.closeClient(old)
 	}
 
 	s.clients[client] = true
-	s.clientByID[client.ID] = client
+	s.clientByID[key] = client
 
-	slog.Info(
-		"客户端连接",
+	slog.Info("客户端连接",
 		"id", client.ID,
 		"type", client.Type,
 		"addr", client.conn.RemoteAddr(),
 	)
 }
 
-func (s *Server) unregisterClient(
-	client *Client,
-) {
-	// 只有当 clientByID 里存的仍然是这个 client 实例时才删除，
-	// 防止旧连接的注销把新连接（同 ID 顶替上来的）从表里删掉。
-	if cur, ok := s.clientByID[client.ID]; ok && cur == client {
-		delete(s.clientByID, client.ID)
+func (s *Server) unregisterClient(client *Client) {
+	key := clientKey(client.Type, client.ID)
+
+	if cur, ok := s.clientByID[key]; ok && cur == client {
+		delete(s.clientByID, key)
 	}
+
 	if _, ok := s.clients[client]; !ok {
-		// 已经被清理过（例如被 registerClient 中的 closeClient
-		// 处理过），避免重复关闭。
 		return
 	}
+
 	s.closeClient(client)
 
-	slog.Info(
-		"客户端断开",
+	slog.Info("客户端断开",
 		"id", client.ID,
 		"type", client.Type,
 	)
 }
-// closeClient 做实际的资源清理：从 clients 表移除、关闭 send channel
-// 和底层连接。只应该在持有单一事件循环（Run goroutine）时调用。
+
 func (s *Server) closeClient(client *Client) {
 	delete(s.clients, client)
 
@@ -112,114 +112,68 @@ func (s *Server) closeClient(client *Client) {
 	client.conn.Close()
 }
 
-func (s *Server) routeMessage(msg *protocol.Message) {
-	slog.Info(
-		"route msg",
+func (s *Server) routeMessage(from *Client, msg *protocol.Message) {
+	slog.Info("route msg",
 		"from", msg.From,
 		"to", msg.To,
+		"type", from.Type,
 	)
+
+	// 指定目标
 	if msg.To != "" {
-		s.sendTo(msg.To, msg)
+		targetType := "device"
+		if from.Type == "device" {
+			targetType = "browser"
+		}
+
+		s.sendTo(targetType, msg.To, msg)
 		return
 	}
 
-	// 没有 To，根据消息来源的 Client.Type（服务端在握手时记录，
-	// 而不是靠猜测 ID 前缀）决定广播对象。
-	fromClient, ok := s.clientByID[msg.From]
-	if !ok {
-		slog.Warn(
-			"无法确定消息路由：来源客户端已不在线",
-			"from", msg.From,
-		)
-		return
-	}
-
-	switch fromClient.Type {
+	// 不指定目标
+	switch from.Type {
 	case "device":
-		// 设备 → 所有浏览器
-		s.broadcastByType("browser", msg)
+		// 设备 → 同一台电脑上的浏览器
+		s.sendTo("browser", from.ID, msg)
+
 	case "browser":
 		// 浏览器 → 所有设备
 		s.broadcastByType("device", msg)
-	default:
-		slog.Warn(
-			"无法确定消息路由",
-			"from", msg.From,
-			"type", fromClient.Type,
-		)
 	}
-
-	// 没有 To，根据消息来源决定广播对象
-	// if strings.HasPrefix(msg.From, "dev") {
-	// 	// 设备 → 所有浏览器
-	// 	s.broadcastByType(
-	// 		"browser",
-	// 		msg,
-	// 	)
-	// 	return
-	// }
-	// if strings.HasPrefix(msg.From, "brow") {
-	// 	// 浏览器 → 所有设备
-	// 	s.broadcastByType(
-	// 		"device",
-	// 		msg,
-	// 	)
-	// 	return
-	// }
-	// slog.Warn(
-	// 	"无法确定消息路由",
-	// 	"from", msg.From,
-	// )
 }
 
-func (s *Server) sendTo(
-	id string,
-	msg *protocol.Message,
-) {
-	client, ok := s.clientByID[id]
-
+func (s *Server) sendTo(clientType, id string, msg *protocol.Message) {
+	client, ok := s.clientByID[clientKey(clientType, id)]
 	if !ok {
-		slog.Warn(
-			"目标不存在",
-			"to", id,
+		slog.Warn("目标不存在",
+			"type", clientType,
+			"id", id,
 		)
 		return
 	}
 
 	data, err := json.Marshal(msg)
 	if err != nil {
-		slog.Error(
-			"消息序列化失败",
-			"error", err,
-		)
+		slog.Error("消息序列化失败", "error", err)
 		return
 	}
 
-	// client.send <- data
-
-	// 非阻塞发送：Run() 是整个网关唯一的事件循环，这里绝不能被某个
-	// 慢客户端卡住，否则所有客户端的注册/注销/路由都会被拖死。
 	if err := client.enqueue(data); err != nil {
-		slog.Error(
-			"发送失败，客户端缓冲已满",
+		slog.Error("发送失败",
 			"client", client.ID,
 			"error", err,
 		)
 	}
 }
 
-func (s *Server) broadcastByType(
-	clientType string,
-	msg *protocol.Message,
-) {
-
+func (s *Server) broadcastByType(clientType string, msg *protocol.Message) {
 	for client := range s.clients {
 		if client.Type != clientType {
 			continue
 		}
+
 		if err := client.Send(msg); err != nil {
-			slog.Error(
-				"广播失败",
+			slog.Error("广播失败",
 				"client", client.ID,
 				"error", err,
 			)
@@ -227,42 +181,29 @@ func (s *Server) broadcastByType(
 	}
 }
 
-func (s *Server) Handler(
-	w http.ResponseWriter,
-	r *http.Request,
-) {
+func (s *Server) Handler(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
+
 	clientType := query.Get("type")
 	clientID := query.Get("id")
 
 	if clientType == "" || clientID == "" {
 		http.Error(w, "missing id or type", http.StatusBadRequest)
-		slog.Warn("missing websocket client info")
 		return
 	}
 
-	conn, err := s.upgrader.Upgrade(
-		w,
-		r,
-		nil,
-	)
-
+	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		slog.Error(
-			"websocket upgrade failed",
-			"error", err,
-		)
+		slog.Error("websocket upgrade failed", "error", err)
 		return
 	}
 
-
-	client := NewClient(
-		conn,
-		s,
-	)
+	client := NewClient(conn, s)
 	client.ID = clientID
 	client.Type = clientType
+
 	s.register <- client
+
 	go client.WriteLoop()
 	go client.ReadLoop()
 }

@@ -33,6 +33,7 @@ func (c *Client) ReadLoop() {
 	defer func() {
 		c.server.unregister <- c
 	}()
+
 	for {
 		_, data, err := c.conn.ReadMessage()
 		if err != nil {
@@ -49,13 +50,12 @@ func (c *Client) ReadLoop() {
 			}
 			return
 		}
-		slog.Info("收到ws数据","ws数据",data)
+
+		slog.Info("收到ws数据", "ws数据", data)
+
 		var msg protocol.Message
-		err = json.Unmarshal(
-			data,
-			&msg,
-		)
-		if err != nil {
+
+		if err := json.Unmarshal(data, &msg); err != nil {
 			slog.Warn(
 				"无效消息",
 				"id", c.ID,
@@ -64,33 +64,15 @@ func (c *Client) ReadLoop() {
 			continue
 		}
 
-		// 分选机发送的不是 Message，
-		// 而是直接发送检测结果 JSON
-		if msg.From == "" && msg.ID == "" {
-			var payload any
+		// 不相信客户端自己传的 From
+		msg.From = c.ID
 
-			if err := json.Unmarshal(data, &payload); err != nil {
-				slog.Warn(
-					"分选机数据解析失败",
-					"id", c.ID,
-					"error", err,
-				)
-				continue
-			}
+		slog.Info("即将发送数据", "数据", msg)
 
-			msg = protocol.Message{
-				Type:    "sort_result",
-				From:    c.ID,
-				Payload: payload,
-			}
-		} else {
-			// 不相信客户端自己传的 From
-			msg.From = c.ID
+		c.server.route <- routeMessage{
+			client: c,
+			msg:    &msg,
 		}
-
-		
-		slog.Info("即将发送数据","数据",msg)
-		c.server.route <- &msg
 	}
 }
 

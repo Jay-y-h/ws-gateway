@@ -1,2 +1,4 @@
 # 忽略整个目录
 release/
+*.exe
+*.exe*
